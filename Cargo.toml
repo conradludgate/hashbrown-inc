@@ -1,0 +1,9 @@
+[package]
+name = "hashbrown-inc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clashmap = "1.2.0"
+hashbrown = { version = "0.15.2", default-features = false }
+polonius-the-crab = "0.4.2"

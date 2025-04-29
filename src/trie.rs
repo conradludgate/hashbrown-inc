@@ -1,0 +1,200 @@
+use hashbrown::HashTable;
+
+// pub(crate) unsafe fn debug_unreachable() -> ! {
+//     #[cfg(debug_assertions)]
+//     unreachable!();
+
+//     #[cfg(not(debug_assertions))]
+//     unsafe {
+//         core::hint::unreachable_unchecked()
+//     };
+// }
+
+pub(crate) struct HashTableTrie<T> {
+    // invariant: map.len() is always 1 less than a power of two
+    map: Vec<Option<HashTable<T>>>,
+    tables: usize,
+}
+
+/// top 7 bits for hashbrown
+/// spare
+/// bottom 7 bits for hashbrown (with 1024 entries max)
+/// we shall use `hash >> 7` as our search key, using the bottom bits.
+const SHIFT: u32 = 7;
+
+const CAP: usize = 1024 * 7 / 8;
+
+impl<T> HashTableTrie<T> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            map: Vec::new(),
+            tables: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn trie_len(&self) -> usize {
+        self.map.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tables(&self) -> usize {
+        self.tables
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &HashTable<T>> {
+        self.map.iter().filter_map(|x| x.as_ref())
+    }
+
+    pub(crate) fn iter_mut(&mut self) -> TableIterMut<T> {
+        TableIterMut {
+            slice: self.map.iter_mut(),
+        }
+    }
+
+    fn search_hash(&self, hash: u64) -> (usize, usize) {
+        let key = hash >> SHIFT;
+        self.search(key as usize)
+    }
+
+    // returns key mask and index
+    fn search(&self, key: usize) -> (usize, usize) {
+        // invariant 0: map.len() is always 1 less than a power of two
+        debug_assert!((self.map.len() + 1).is_power_of_two());
+
+        // invariant 1: offset is always 1 less than a power of two
+        // invariant 2: offset is always less than or equal to usize::MAX
+        let mut offset = 0;
+        loop {
+            debug_assert!(offset < self.map.len());
+
+            // since offset and map.len() are 1 less thw a power of two, it follows that
+            // invariant 3: offset * 2 < self.map.len()
+
+            // since map.len() <= isize::MAX, it follows that
+            // invariant 4: offset * 2 < isize::MAX
+
+            // invariant 5: key <= offset
+            let key = key & offset;
+            // invariant 6: index <= offset * 2 < self.map.len()
+            // this cannot overflow given invariant 4
+            let index = offset + key;
+
+            let mask = offset;
+            // this preserves invariant 1
+            offset = offset * 2 + 1;
+
+            // Safety: invariants 6 ensures that
+            // index <= offset * 2 < self.map.len()
+            // therefore it is inbounds.
+            if unsafe { self.map.get_unchecked(index) }.is_some() {
+                return (mask, index);
+            }
+        }
+    }
+
+    pub(crate) fn get_table<'a>(&'a self, hash: u64) -> &'a HashTable<T> {
+        if self.tables == 0 {
+            return const { &HashTable::new() };
+        }
+
+        let (_, index) = self.search_hash(hash);
+        self.map[index].as_ref().unwrap()
+    }
+
+    pub(crate) fn get_table_mut<'a>(&'a mut self, hash: u64) -> &'a mut HashTable<T> {
+        if self.tables == 0 {
+            self.map.push(Some(HashTable::new()));
+            self.tables += 1;
+        }
+
+        let (_, index) = self.search_hash(hash);
+        self.map[index].as_mut().unwrap()
+    }
+
+    pub(crate) fn get_table_for_insert<'a>(
+        &'a mut self,
+        hash: u64,
+        hasher: impl Fn(&T) -> u64,
+    ) -> &'a mut HashTable<T> {
+        if self.tables == 0 {
+            self.map.push(Some(HashTable::new()));
+            self.tables += 1;
+        }
+
+        use polonius_the_crab::{polonius, polonius_return};
+        let mut this = self;
+
+        loop {
+            let (mask, index) = this.search_hash(hash);
+
+            polonius!(|this| -> &'polonius mut HashTable<T> {
+                let table = this.map[index].as_mut().unwrap();
+
+                // inserting will not cause a realloc.
+                if table.len() < CAP {
+                    polonius_return!(table);
+                }
+            });
+
+            // need to split.
+            let table = HashTable::with_capacity(CAP);
+            let next_mask = mask * 2 + 1;
+            let (left, right) = this.split(mask, index, table);
+
+            let entries = left.extract_if(|e| {
+                let hash = hasher(e) as usize;
+                let key = (hash >> SHIFT) & next_mask;
+                key > mask
+            });
+            for e in entries {
+                let hash = hasher(&e);
+                right.insert_unique(hash, e, &hasher);
+            }
+        }
+    }
+
+    fn split(
+        &mut self,
+        mask: usize,
+        index: usize,
+        entry: HashTable<T>,
+    ) -> (&mut HashTable<T>, &mut HashTable<T>) {
+        let next_mask = mask * 2 + 1;
+        let next_len = next_mask * 2 + 1;
+
+        let next0 = next_mask + index - mask;
+        let next1 = next_mask + index + 1;
+
+        if next_len > self.map.len() {
+            self.map.resize_with(next_len, || None);
+        }
+
+        assert_ne!(next0, next1);
+
+        let entry0 = self.map[index].take().expect("cell should be set");
+        let entry1 = entry;
+
+        let [slot0, slot1] = self.map.get_disjoint_mut([next0, next1]).unwrap();
+
+        self.tables += 1;
+
+        (slot0.insert(entry0), slot1.insert(entry1))
+    }
+}
+
+pub(crate) struct TableIterMut<'a, T> {
+    slice: core::slice::IterMut<'a, Option<HashTable<T>>>,
+}
+
+impl<'a, T> Iterator for TableIterMut<'a, T> {
+    type Item = &'a mut HashTable<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(next) = self.slice.next()? {
+                break Some(next);
+            }
+        }
+    }
+}
