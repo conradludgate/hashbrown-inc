@@ -5,5 +5,19 @@ edition = "2024"
 
 [dependencies]
 clashmap = "1.2.0"
-hashbrown = { version = "0.15.2", default-features = false }
+hashbrown = { version = "0.15.2", default-features = false, path = "../hashbrown" }
 polonius-the-crab = "0.4.2"
+# cfg-if = "1"
+
+[dev-dependencies]
+foldhash = { version = "0.1.2", default-features = false }
+hdrhistogram = "7"
+hashbrown = { version = "0.15.2", features = ["inline-more"], path = "../hashbrown" }
+
+[[bench]]
+harness = false
+name = "insert"
+
+[[bench]]
+harness = false
+name = "get"

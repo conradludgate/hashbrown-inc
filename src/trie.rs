@@ -1,18 +1,19 @@
 use hashbrown::HashTable;
 
-// pub(crate) unsafe fn debug_unreachable() -> ! {
-//     #[cfg(debug_assertions)]
-//     unreachable!();
+pub(crate) unsafe fn debug_unreachable() -> ! {
+    #[cfg(debug_assertions)]
+    unreachable!();
 
-//     #[cfg(not(debug_assertions))]
-//     unsafe {
-//         core::hint::unreachable_unchecked()
-//     };
-// }
+    #[cfg(not(debug_assertions))]
+    unsafe {
+        core::hint::unreachable_unchecked()
+    };
+}
 
 pub(crate) struct HashTableTrie<T> {
     // invariant: map.len() is always 1 less than a power of two
     map: Vec<Option<HashTable<T>>>,
+    cached: HashTable<T>,
     tables: usize,
 }
 
@@ -28,6 +29,7 @@ impl<T> HashTableTrie<T> {
     pub(crate) const fn new() -> Self {
         Self {
             map: Vec::new(),
+            cached: HashTable::new(),
             tables: 0,
         }
     }
@@ -40,6 +42,10 @@ impl<T> HashTableTrie<T> {
     #[cfg(test)]
     pub(crate) fn tables(&self) -> usize {
         self.tables
+    }
+
+    pub fn allocation_size(&self) -> usize {
+        self.iter().map(|t| t.allocation_size()).sum::<usize>() + core::mem::size_of_val(&*self.map)
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = &HashTable<T>> {
@@ -112,7 +118,13 @@ impl<T> HashTableTrie<T> {
         self.map[index].as_mut().unwrap()
     }
 
-    pub(crate) fn get_table_for_insert<'a>(
+    /// Gets the hashtable corresponding with the hash.
+    ///
+    /// # Safety
+    /// Caller must only insert 1 item.
+    ///
+    /// Guarantees there is capacity in the hashtable.
+    pub(crate) unsafe fn get_table_for_insert<'a>(
         &'a mut self,
         hash: u64,
         hasher: impl Fn(&T) -> u64,
@@ -131,55 +143,77 @@ impl<T> HashTableTrie<T> {
             polonius!(|this| -> &'polonius mut HashTable<T> {
                 let table = this.map[index].as_mut().unwrap();
 
-                // inserting will not cause a realloc.
-                if table.len() < CAP {
+                let mut cap = table.capacity();
+                let growth_left = cap - table.len();
+
+                // inserting will not cause a realloc beyond CAP.
+                if growth_left >= 1 || cap <= CAP / 2 {
+                    if growth_left < 1 {
+                        table.reserve(1, &hasher);
+                        cap = table.capacity();
+                        debug_assert!(cap <= CAP, "new capacity too large {cap}");
+                    }
+
                     polonius_return!(table);
                 }
             });
 
             // need to split.
-            let table = HashTable::with_capacity(CAP);
-            let next_mask = mask * 2 + 1;
-            let (left, right) = this.split(mask, index, table);
-
-            let entries = left.extract_if(|e| {
-                let hash = hasher(e) as usize;
-                let key = (hash >> SHIFT) & next_mask;
-                key > mask
-            });
-            for e in entries {
-                let hash = hasher(&e);
-                right.insert_unique(hash, e, &hasher);
-            }
+            this.split(mask, index, &hasher);
         }
     }
 
-    fn split(
-        &mut self,
-        mask: usize,
-        index: usize,
-        entry: HashTable<T>,
-    ) -> (&mut HashTable<T>, &mut HashTable<T>) {
+    #[cold]
+    #[inline(never)]
+    fn split(&mut self, mask: usize, index: usize, hasher: impl Fn(&T) -> u64) {
         let next_mask = mask * 2 + 1;
         let next_len = next_mask * 2 + 1;
 
         let next0 = next_mask + index - mask;
         let next1 = next_mask + index + 1;
+        debug_assert_ne!(next0, next1);
 
         if next_len > self.map.len() {
             self.map.resize_with(next_len, || None);
         }
 
-        assert_ne!(next0, next1);
+        let mut left = HashTable::with_capacity(CAP);
+        if self.cached.capacity() == 0 {
+            let prev_cached = core::mem::replace(&mut self.cached, HashTable::with_capacity(CAP));
+            // it's empty and has no capacity, don't include drop glue.
+            core::mem::forget(prev_cached);
+        }
+        let mut right = core::mem::take(&mut self.cached);
 
-        let entry0 = self.map[index].take().expect("cell should be set");
-        let entry1 = entry;
+        // Safety: for next0 to equal next1, we must have mask = usize::MAX.
+        // mask is always < map.len().
+        // map.len() <= isize::MAX, therefore they are not equal.
+        // Safety: for next0 to equal index, we must have next_mask = mask, which is impossible.
+        // Safety: for next1 to equal index, we must have next_mask = usize::MAX, which is impossible.
+        let [table_slot, slot0, slot1] =
+            unsafe { self.map.get_disjoint_unchecked_mut([index, next0, next1]) };
 
-        let [slot0, slot1] = self.map.get_disjoint_mut([next0, next1]).unwrap();
+        // Safety: caller will insure that index is in the map.
+        // We don't take here, because we need to preserve the table invariant if hasher panics.
+        let table = unsafe { table_slot.as_mut().unwrap_unchecked() };
 
+        let next_mask = mask * 2 + 1;
+        for e in table.drain() {
+            let hash = hasher(&e);
+            let key = (hash >> SHIFT) as usize & next_mask;
+            let t = if key <= mask { &mut left } else { &mut right };
+
+            // Safety: table is guaranteed to have a length <= CAP.
+            // Worst case, all entries go to the same table, but these are pre-allocated with enough capacity.
+            t.insert_unique(hash, e, |_| unsafe { debug_unreachable() });
+        }
+
+        // Safety: same as above.
+        let table = unsafe { table_slot.take().unwrap_unchecked() };
+        core::mem::forget(core::mem::replace(&mut self.cached, table));
+        core::mem::forget(core::mem::replace(slot0, Some(left)));
+        core::mem::forget(core::mem::replace(slot1, Some(right)));
         self.tables += 1;
-
-        (slot0.insert(entry0), slot1.insert(entry1))
     }
 }
 
