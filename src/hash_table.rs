@@ -105,8 +105,8 @@ impl<T> IncHashTable<T> {
     pub fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
         let Self { old, curr } = self;
 
-        let old = core::mem::replace(old, DrainingTable::empty());
-        old.chain(curr.drain())
+        let mut old = core::mem::replace(old, DrainingTable::empty());
+        core::iter::from_fn(move || old.pop()).chain(curr.drain())
     }
 
     /// Retains only the elements specified by the predicate.
@@ -170,7 +170,7 @@ impl<T> IncHashTable<T> {
         hasher: impl Fn(&T) -> u64,
     ) {
         let old = core::mem::replace(&mut self.old, replace);
-        old.for_each(|mut e| {
+        old.take_all((), |(), mut e| {
             if f(&mut e) {
                 // Safety: we always allocate enough space in curr for all old entries
                 self.curr
@@ -181,7 +181,7 @@ impl<T> IncHashTable<T> {
 
     #[inline]
     fn rehash_one(&mut self, hasher: impl Fn(&T) -> u64) -> bool {
-        let Some(e) = self.old.next() else {
+        let Some(e) = self.old.pop() else {
             return false;
         };
 
@@ -357,7 +357,7 @@ impl<T> Iterator for IntoIter<T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.old.next().or_else(|| self.curr.next())
+        self.old.pop().or_else(|| self.curr.next())
     }
 }
 

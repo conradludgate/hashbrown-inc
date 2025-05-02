@@ -87,7 +87,7 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 [[package]]
 name = "hashbrown"
 version = "0.15.2"
-source = "git+https://github.com/conradludgate/hashbrown?branch=draining-table#7883c772d47da75f524aa54c3d9ff140694655f7"
+source = "git+https://github.com/conradludgate/hashbrown?branch=draining-table#40514096776443bc72046958260d6c68e04e64f0"
 dependencies = [
  "allocator-api2",
  "equivalent",
